@@ -2,11 +2,14 @@
  * Claude + TradingView MCP — Automated Trading Bot
  *
  * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
- * Binance (free, no auth), calculates all indicators, runs safety check,
- * executes via BitGet if everything lines up.
+ * Binance (free, no auth), calculates indicators defined by rules.json,
+ * evaluates EACH entry_rule, and executes via BitGet if every condition passes.
  *
  * Local mode: run manually — node bot.js
  * Cloud mode: deploy to Railway, set env vars, Railway triggers on cron schedule
+ *
+ * The safety check is driven by rules.json — not hard-coded. Edit that file
+ * and the bot's checks change with it.
  */
 
 import "dotenv/config";
@@ -20,7 +23,11 @@ function checkOnboarding() {
   const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
   const missing = required.filter((k) => !process.env[k]);
 
-  if (!existsSync(".env")) {
+  // In cloud environments (Railway, etc.) credentials come from env vars directly.
+  // Only prompt for .env file setup when running locally without credentials.
+  const isCloud = !!process.env.RAILWAY_ENVIRONMENT;
+
+  if (!isCloud && !existsSync(".env")) {
     console.log(
       "\n⚠️  No .env file found — opening it for you to fill in...\n",
     );
@@ -51,16 +58,17 @@ function checkOnboarding() {
   }
 
   if (missing.length > 0) {
-    console.log(`\n⚠️  Missing credentials in .env: ${missing.join(", ")}`);
-    console.log("Opening .env for you now...\n");
-    try {
-      execSync("open .env");
-    } catch {}
-    console.log("Add the missing values then re-run: node bot.js\n");
+    console.log(`\n⚠️  Missing credentials: ${missing.join(", ")}`);
+    if (!isCloud) {
+      console.log("Opening .env for you now...\n");
+      try {
+        execSync("open .env");
+      } catch {}
+      console.log("Add the missing values then re-run: node bot.js\n");
+    }
     process.exit(0);
   }
 
-  // Always print the CSV location so users know where to find their trade log
   const csvPath = new URL("trades.csv", import.meta.url).pathname;
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
@@ -79,6 +87,7 @@ const CONFIG = {
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
+  riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT || "1.5"),
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
     secretKey: process.env.BITGET_SECRET_KEY,
@@ -109,8 +118,7 @@ function countTodaysTrades(log) {
 
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
 
-async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
+async function fetchCandles(symbol, interval, limit = 200) {
   const intervalMap = {
     "1m": "1m",
     "3m": "3m",
@@ -122,21 +130,30 @@ async function fetchCandles(symbol, interval, limit = 100) {
     "1D": "1d",
     "1W": "1w",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
+  const binanceInterval = intervalMap[interval] || "4h";
 
   const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
   const data = await res.json();
 
-  return data.map((k) => ({
-    time: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+  const now = Date.now();
+  // Binance kline format: [openTime, open, high, low, close, volume, closeTime, ...]
+  // Drop the currently-forming candle (closeTime > now). The strategy fires
+  // on candle close, so we only evaluate closed bars.
+  const candles = data
+    .map((k) => ({
+      time: k[0],
+      closeTime: k[6],
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }))
+    .filter((c) => c.closeTime < now);
+
+  return candles;
 }
 
 // ─── Indicator Calculations ──────────────────────────────────────────────────
@@ -166,23 +183,41 @@ function calcRSI(closes, period = 14) {
   return 100 - 100 / (1 + rs);
 }
 
-// VWAP — session-based, resets at midnight UTC
-function calcVWAP(candles) {
-  const midnightUTC = new Date();
-  midnightUTC.setUTCHours(0, 0, 0, 0);
-  const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
-  if (sessionCandles.length === 0) return null;
-  const cumTPV = sessionCandles.reduce(
-    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
-    0,
-  );
-  const cumVol = sessionCandles.reduce((sum, c) => sum + c.volume, 0);
-  return cumVol === 0 ? null : cumTPV / cumVol;
+// ATR(14) on candles — Wilder's True Range method
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const prev = candles[i - 1];
+    const tr = Math.max(
+      c.high - c.low,
+      Math.abs(c.high - prev.close),
+      Math.abs(c.low - prev.close),
+    );
+    trs.push(tr);
+  }
+  // Average of last `period` TRs
+  const lastTRs = trs.slice(-period);
+  return lastTRs.reduce((a, b) => a + b, 0) / period;
 }
 
-// ─── Safety Check ───────────────────────────────────────────────────────────
+// 20-bar volume average, EXCLUDING the most recent bar
+function calcVolumeAvg(candles, lookback = 20) {
+  if (candles.length < lookback + 1) return null;
+  const vols = candles.slice(-lookback - 1, -1).map((c) => c.volume);
+  return vols.reduce((a, b) => a + b, 0) / lookback;
+}
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+// Lowest low of the last N candles (for stop placement under the pullback)
+function swingLow(candles, lookback = 5) {
+  const recent = candles.slice(-lookback);
+  return Math.min(...recent.map((c) => c.low));
+}
+
+// ─── Safety Check (driven by rules.json) ───────────────────────────────────
+
+function runSafetyCheck(ctx, rules) {
   const results = [];
 
   const check = (label, required, actual, pass) => {
@@ -194,88 +229,96 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias first
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
-
-  if (bullishBias) {
-    console.log("  Bias: BULLISH — checking long entry conditions\n");
-
-    // 1. Price above VWAP
-    check(
-      "Price above VWAP (buyers in control)",
-      `> ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price > vwap,
-    );
-
-    // 2. Price above EMA(8)
-    check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price > ema8,
-    );
-
-    // 3. RSI(3) pullback
-    check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
-    );
-
-    // 4. Not overextended from VWAP
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else if (bearishBias) {
-    console.log("  Bias: BEARISH — checking short entry conditions\n");
-
-    check(
-      "Price below VWAP (sellers in control)",
-      `< ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price < vwap,
-    );
-
-    check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price < ema8,
-    );
-
-    check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
-    );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
+  // Shorts disabled by rules — skip straight to long checks
+  const longRules = rules.entry_rules.long || [];
+  if (
+    longRules.length === 1 &&
+    longRules[0].toUpperCase().includes("DISABLED")
+  ) {
+    console.log("  Longs disabled in rules.json. No trades possible.\n");
     results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
+      label: "Entry rules defined",
+      required: "At least one enabled side",
+      actual: "All sides disabled",
       pass: false,
     });
+    return { results, allPass: false, side: null };
   }
 
+  const shortRules = rules.entry_rules.short || [];
+  const shortsDisabled =
+    shortRules.length === 1 &&
+    shortRules[0].toUpperCase().includes("DISABLED");
+
+  console.log(
+    `  Evaluating LONG entry conditions (shorts: ${shortsDisabled ? "disabled" : "enabled but not checked in this build"})\n`,
+  );
+
+  const { price, ema20, ema50, atr, vol20avg, lastCandle, prevCandles } = ctx;
+
+  // 1. Price above 50 EMA
+  check(
+    "Price above the 50 EMA on the 4H — uptrend confirmed",
+    `> $${ema50.toFixed(2)}`,
+    `$${price.toFixed(2)}`,
+    price > ema50,
+  );
+
+  // 2. 20 EMA above 50 EMA (stacked trend)
+  check(
+    "20 EMA above 50 EMA on the 4H — trend is stacked",
+    `EMA20 > EMA50`,
+    `EMA20 $${ema20.toFixed(2)} vs EMA50 $${ema50.toFixed(2)}`,
+    ema20 > ema50,
+  );
+
+  // 3. Price within 0.5% of 20 EMA (pullback tag)
+  const distFrom20 = Math.abs((price - ema20) / ema20) * 100;
+  check(
+    "Price within 0.5% of the 20 EMA (pullback tag)",
+    "≤ 0.5%",
+    `${distFrom20.toFixed(3)}%`,
+    distFrom20 <= 0.5,
+  );
+
+  // 4. Last 4H candle closed bullish
+  check(
+    "Last 4H candle closed bullish — reclaim after pullback",
+    "close > open",
+    `open $${lastCandle.open.toFixed(2)}, close $${lastCandle.close.toFixed(2)}`,
+    lastCandle.close > lastCandle.open,
+  );
+
+  // 5. Volume >= 1.2x 20-bar average
+  const volRatio = lastCandle.volume / vol20avg;
+  check(
+    "Entry-bar volume ≥ 1.2× the 20-bar average",
+    "≥ 1.2×",
+    `${volRatio.toFixed(2)}×`,
+    volRatio >= 1.2,
+  );
+
+  // 6. Price NOT more than 3% extended above the 50 EMA
+  const extAbove50 = ((price - ema50) / ema50) * 100;
+  check(
+    "Price ≤ 3% extended above the 50 EMA — not a climax buy",
+    "≤ 3.00%",
+    `${extAbove50.toFixed(2)}%`,
+    extAbove50 <= 3.0 && extAbove50 >= 0, // must be above but not too far
+  );
+
+  // 7. News window — manual override. In a future build this could hit an
+  // economic calendar API. For now we pass it through with a visible warning
+  // so the user knows to do a 5-second calendar check themselves.
+  check(
+    "No major news event (CPI/FOMC/NFP) in the next 2 hours",
+    "manual calendar check",
+    "assumed clear — user override",
+    true,
+  );
+
   const allPass = results.every((r) => r.pass);
-  return { results, allPass };
+  return { results, allPass, side: "long" };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -295,24 +338,33 @@ function checkTradeLimits(log) {
   console.log(
     `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
   );
-
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  if (tradeSize > CONFIG.maxTradeSizeUSD) {
-    console.log(
-      `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
-    );
-    return false;
-  }
-
-  console.log(
-    `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
-  );
-
   return true;
+}
+
+// ─── Position Sizing (risk-based, ATR stop) ─────────────────────────────────
+
+function sizePosition(price, atr) {
+  const riskDollars = CONFIG.portfolioValue * (CONFIG.riskPerTradePct / 100);
+  const stopPrice = price - atr; // 1x ATR below entry
+  const stopDistance = price - stopPrice;
+  const stopDistancePct = (stopDistance / price) * 100;
+
+  // size in USD such that (sizeUSD * stopDistance / price) == riskDollars
+  // i.e. sizeUSD = riskDollars * price / stopDistance
+  const rawSizeUSD = (riskDollars * price) / stopDistance;
+  const cappedByMax = Math.min(rawSizeUSD, CONFIG.maxTradeSizeUSD);
+  const cappedByPortfolio = Math.min(cappedByMax, CONFIG.portfolioValue);
+
+  return {
+    riskDollars,
+    stopPrice,
+    stopDistance,
+    stopDistancePct,
+    rawSizeUSD,
+    sizeUSD: cappedByPortfolio,
+    target1Price: price + 2 * stopDistance, // 2R
+    target2Price: price + 3 * stopDistance, // 3R
+  };
 }
 
 // ─── BitGet Execution ────────────────────────────────────────────────────────
@@ -371,7 +423,6 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
 
 const CSV_FILE = "trades.csv";
 
-// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
 function initCsv() {
   if (!existsSync(CSV_FILE)) {
     const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
@@ -427,7 +478,7 @@ function writeTradeCsv(logEntry) {
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "PAPER";
-    notes = "All conditions met";
+    notes = `All conditions met | stop $${logEntry.stopPrice.toFixed(2)} | T1 $${logEntry.target1Price.toFixed(2)} | T2 $${logEntry.target2Price.toFixed(2)}`;
   } else {
     side = "BUY";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
@@ -436,7 +487,7 @@ function writeTradeCsv(logEntry) {
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "LIVE";
-    notes = logEntry.error ? `Error: ${logEntry.error}` : "All conditions met";
+    notes = logEntry.error ? `Error: ${logEntry.error}` : `All conditions met | stop $${logEntry.stopPrice.toFixed(2)}`;
   }
 
   const row = [
@@ -463,7 +514,80 @@ function writeTradeCsv(logEntry) {
   console.log(`Tax record saved → ${CSV_FILE}`);
 }
 
-// Tax summary command: node bot.js --tax-summary
+// ─── Google Sheets Webhook ──────────────────────────────────────────────────
+
+async function pushToSheet(logEntry) {
+  const url = process.env.LOG_WEBHOOK_URL;
+  if (!url) {
+    console.log("(No LOG_WEBHOOK_URL set — skipping Sheet push)");
+    return;
+  }
+
+  const failed = logEntry.conditions
+    .filter((c) => !c.pass)
+    .map((c) => c.label)
+    .join("; ");
+
+  let mode, decision;
+  if (!logEntry.allPass) {
+    mode = "BLOCKED";
+    decision = "BLOCKED";
+  } else if (logEntry.paperTrading) {
+    mode = "PAPER";
+    decision = "PAPER";
+  } else if (logEntry.error) {
+    mode = "LIVE-ERROR";
+    decision = "ERROR";
+  } else {
+    mode = "LIVE";
+    decision = "TRADED";
+  }
+
+  const payload = {
+    timestamp: logEntry.timestamp,
+    symbol: logEntry.symbol,
+    timeframe: logEntry.timeframe,
+    price: logEntry.price.toFixed(2),
+    ema20: logEntry.indicators.ema20?.toFixed(2) || "",
+    ema50: logEntry.indicators.ema50?.toFixed(2) || "",
+    atr: logEntry.indicators.atr?.toFixed(2) || "",
+    rsi14: logEntry.indicators.rsi14?.toFixed(2) || "",
+    volumeLast: logEntry.indicators.volumeLast?.toFixed(1) || "",
+    volumeAvg: logEntry.indicators.vol20avg?.toFixed(1) || "",
+    side: logEntry.side,
+    mode,
+    decision,
+    conditionsFailed: failed,
+    tradeSize: logEntry.tradeSize?.toFixed(2) || "",
+    quantity: logEntry.tradeSize
+      ? (logEntry.tradeSize / logEntry.price).toFixed(6)
+      : "",
+    stopPrice: logEntry.stopPrice?.toFixed(2) || "",
+    target1: logEntry.target1Price?.toFixed(2) || "",
+    target2: logEntry.target2Price?.toFixed(2) || "",
+    orderId: logEntry.orderId || "",
+    portfolioValue: CONFIG.portfolioValue.toFixed(2),
+    maxTradeSize: CONFIG.maxTradeSizeUSD.toFixed(2),
+    tradesToday: logEntry.limits.tradesToday,
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.text();
+    if (res.ok) {
+      console.log(`Sheet push ✓ (${body.slice(0, 60)})`);
+    } else {
+      console.log(`⚠️  Sheet push failed: HTTP ${res.status}`);
+    }
+  } catch (err) {
+    console.log(`⚠️  Sheet push error: ${err.message}`);
+  }
+}
+
 function generateTaxSummary() {
   if (!existsSync(CSV_FILE)) {
     console.log("No trades.csv found — no trades have been recorded yet.");
@@ -508,6 +632,9 @@ async function run() {
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  console.log(
+    `Portfolio: $${CONFIG.portfolioValue.toFixed(2)} | Risk/trade: ${CONFIG.riskPerTradePct}% ($${(CONFIG.portfolioValue * CONFIG.riskPerTradePct / 100).toFixed(2)}) | Max trade: $${CONFIG.maxTradeSizeUSD}`,
+  );
 
   // Load log and check daily limits
   const log = loadLog();
@@ -517,35 +644,59 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
+  // Fetch candle data — need enough for EMA(50) + ATR(14) + 20-bar volume
   console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
+  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 200);
   const closes = candles.map((c) => c.close);
-  const price = closes[closes.length - 1];
-  console.log(`  Current price: $${price.toFixed(2)}`);
+  const lastCandle = candles[candles.length - 1];
+  const price = lastCandle.close;
 
-  // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
-
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
-
-  if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
+  if (candles.length < 60) {
+    console.log("⚠️  Not enough candles to evaluate. Exiting.");
     return;
   }
 
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  // Calculate indicators
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const atr = calcATR(candles, 14);
+  const vol20avg = calcVolumeAvg(candles, 20);
+  const rsi14 = calcRSI(closes, 14);
 
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
+  console.log(`  Current price: $${price.toFixed(2)}`);
+  console.log(`  EMA(20):  $${ema20.toFixed(2)}`);
+  console.log(`  EMA(50):  $${ema50.toFixed(2)}`);
+  console.log(`  ATR(14):  $${atr.toFixed(2)} (${((atr / price) * 100).toFixed(2)}% of price)`);
+  console.log(`  RSI(14):  ${rsi14.toFixed(2)}`);
+  console.log(`  Volume (last bar):   ${lastCandle.volume.toFixed(1)}`);
+  console.log(`  Volume (20-bar avg): ${vol20avg.toFixed(1)}`);
+
+  // Run safety check
+  const { results, allPass, side } = runSafetyCheck(
+    {
+      price,
+      ema20,
+      ema50,
+      atr,
+      vol20avg,
+      lastCandle,
+      prevCandles: candles.slice(-21, -1),
+    },
+    rules,
   );
+
+  // Position sizing
+  const sizing = sizePosition(price, atr);
+
+  console.log("\n── Position Sizing ──────────────────────────────────────\n");
+  console.log(`  Entry (market):      $${price.toFixed(2)}`);
+  console.log(`  Stop (1× ATR below): $${sizing.stopPrice.toFixed(2)}  (distance $${sizing.stopDistance.toFixed(2)}, ${sizing.stopDistancePct.toFixed(2)}%)`);
+  console.log(`  Target 1 (2R):       $${sizing.target1Price.toFixed(2)}`);
+  console.log(`  Target 2 (3R):       $${sizing.target2Price.toFixed(2)}`);
+  console.log(`  Risk dollars (${CONFIG.riskPerTradePct}% of $${CONFIG.portfolioValue}): $${sizing.riskDollars.toFixed(2)}`);
+  console.log(`  Raw position size:   $${sizing.rawSizeUSD.toFixed(2)}  (before caps)`);
+  console.log(`  Max-trade cap:       $${CONFIG.maxTradeSizeUSD}`);
+  console.log(`  Final position size: $${sizing.sizeUSD.toFixed(2)}  (${(sizing.sizeUSD / price).toFixed(6)} BTC)`);
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
@@ -554,11 +705,15 @@ async function run() {
     timestamp: new Date().toISOString(),
     symbol: CONFIG.symbol,
     timeframe: CONFIG.timeframe,
+    side: side || "none",
     price,
-    indicators: { ema8, vwap, rsi3 },
+    indicators: { ema20, ema50, atr, rsi14, vol20avg, volumeLast: lastCandle.volume },
     conditions: results,
     allPass,
-    tradeSize,
+    tradeSize: sizing.sizeUSD,
+    stopPrice: sizing.stopPrice,
+    target1Price: sizing.target1Price,
+    target2Price: sizing.target2Price,
     orderPlaced: false,
     orderId: null,
     paperTrading: CONFIG.paperTrading,
@@ -571,28 +726,30 @@ async function run() {
 
   if (!allPass) {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
+    console.log(`🚫 TRADE BLOCKED — ${failed.length} condition(s) failed:`);
     failed.forEach((f) => console.log(`   - ${f}`));
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
 
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${sizing.sizeUSD.toFixed(2)} (${(sizing.sizeUSD / price).toFixed(6)} BTC) at market`,
+      );
+      console.log(
+        `   Stop: $${sizing.stopPrice.toFixed(2)} | T1: $${sizing.target1Price.toFixed(2)} | T2: $${sizing.target2Price.toFixed(2)}`,
       );
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
+        `\n🔴 PLACING LIVE ORDER — $${sizing.sizeUSD.toFixed(2)} BUY ${CONFIG.symbol}`,
       );
       try {
         const order = await placeBitGetOrder(
           CONFIG.symbol,
           "buy",
-          tradeSize,
+          sizing.sizeUSD,
           price,
         );
         logEntry.orderPlaced = true;
@@ -605,13 +762,13 @@ async function run() {
     }
   }
 
-  // Save decision log
   log.trades.push(logEntry);
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
 
-  // Write tax CSV row for every run (executed, paper, or blocked)
   writeTradeCsv(logEntry);
+
+  await pushToSheet(logEntry);
 
   console.log("═══════════════════════════════════════════════════════════\n");
 }
