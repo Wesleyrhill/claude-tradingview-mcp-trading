@@ -638,6 +638,35 @@ function generateTaxSummary() {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+// ─── Canary Check ────────────────────────────────────────────────────────────
+// Hits the Binance US endpoint with a minimal 1-candle request before the
+// strategy runs. Logs the HTTP status explicitly so 451 / 4xx failures are
+// immediately visible at the top of every Railway log entry.
+
+async function canaryCheck() {
+  const canaryUrl =
+    "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=4h&limit=1";
+  console.log(`[canary] GET ${canaryUrl}`);
+  try {
+    const res = await fetch(canaryUrl);
+    console.log(`[canary] HTTP ${res.status} ${res.statusText}`);
+    if (!res.ok) {
+      console.error(
+        `[canary] FAIL — Binance US returned ${res.status}. ` +
+          (res.status === 451
+            ? "Geo-block: endpoint may need to change."
+            : "Check network / API availability."),
+      );
+      return false;
+    }
+    console.log("[canary] OK — Binance US reachable, proceeding.");
+    return true;
+  } catch (err) {
+    console.error(`[canary] FAIL — network error: ${err.message}`);
+    return false;
+  }
+}
+
 async function run() {
   checkOnboarding();
   initCsv();
@@ -648,6 +677,13 @@ async function run() {
     `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
   );
   console.log("═══════════════════════════════════════════════════════════");
+
+  // Canary: verify Binance US is reachable before running the strategy
+  const apiOk = await canaryCheck();
+  if (!apiOk) {
+    console.error("Bot halted — Binance US canary check failed. See [canary] lines above.");
+    process.exit(1);
+  }
 
   // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
