@@ -96,6 +96,16 @@ const CONFIG = {
   },
 };
 
+// ─── Startup config validation ──────────────────────────────────────────────
+
+if (!process.env.RISK_PER_TRADE_PCT) {
+  console.warn(
+    "[WARN] RISK_PER_TRADE_PCT is not set in the environment. " +
+    "Defaulting to 1.5% risk per trade. " +
+    "Set RISK_PER_TRADE_PCT in your Railway environment variables to silence this warning."
+  );
+}
+
 const LOG_FILE = "safety-check-log.json";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
@@ -132,9 +142,9 @@ async function fetchCandles(symbol, interval, limit = 200) {
   };
   const binanceInterval = intervalMap[interval] || "4h";
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  const url = `https://api.binance.us/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+  if (!res.ok) throw new Error(`Binance US API error: ${res.status} — if 451, endpoint may be geo-blocked; if 400, check symbol name (Binance US uses BTCUSDT format)`);
   const data = await res.json();
 
   const now = Date.now();

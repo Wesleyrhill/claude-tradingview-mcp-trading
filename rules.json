@@ -1,50 +1,89 @@
 {
   "watchlist": ["BTCUSDT"],
-  "default_timeframe": "1m",
+  "default_timeframe": "4H",
 
   "strategy": {
-    "name": "VWAP + RSI(3) + EMA(8) Scalping Strategy",
-    "sources": ["Lewis Jackson"],
-    "description": "Three indicators, each doing a different job. EMA(8) for trend direction, VWAP for session bias, RSI(3) for entry timing. All three must align before a trade fires."
+    "name": "Pullback-to-20-EMA in a Confirmed Uptrend (scaled from $1000 Learning Plan)",
+    "sources": [
+      "User's $1000 Learning Account rulebook (~/tradingview-mcp-jackson/rules.json)",
+      "Crypto Synthesis v1 Pine reference (daily chart)",
+      "Qullamaggie power-trend + Credible Crypto HTF bias"
+    ],
+    "description": "Only buy dips inside an established uptrend. The 1H trend must already be up (close above 50 EMA AND 20 EMA > 50 EMA). Execute only when price pulls back to the 20 EMA on the 4H and volume confirms. Single setup. No counter-trend trades. No shorts. PAPER account inflated to $5,000 USD so the user can see how position sizing scales — real capital is only $73 USD (~100 CAD).",
+    "account_size_usd": 5000,
+    "paper_only": true,
+    "real_capital_usd": 73,
+    "real_capital_cad": 100,
+    "paper_mode_only_until": "100 paper trades logged with <10% rule violations"
   },
 
   "indicators": {
-    "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
-    "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "ema_20": "Fast trend / pullback target. Entries happen when price taps or closes into the 20 EMA inside an uptrend.",
+    "ema_50": "Slow trend filter. Price MUST be above the 50 EMA on the 4H for any long.",
+    "volume_20_avg": "Confirmation. Entry bar volume must be >= 1.2x the 20-bar average. No trade on anaemic volume.",
+    "atr_14": "Used to size the stop. Stop distance = 1x ATR(14) below the swing low of the pullback."
   },
 
   "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
-    "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
+    "bullish": [
+      "Price is above the 50 EMA on the 4H",
+      "The 20 EMA is above the 50 EMA on the 4H (stacked trend)"
+    ],
+    "bearish": [
+      "Price is below the 50 EMA on the 4H",
+      "The 20 EMA is below the 50 EMA on the 4H"
+    ],
+    "no_trade_zone": "When price is between the 20 and 50 EMA and they are flat — choppy range, stand aside."
   },
 
   "entry_rules": {
     "long": [
-      "Price is above VWAP — buyers in control for the session",
-      "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
+      "Price is above the 50 EMA on the 4H — uptrend confirmed",
+      "The 20 EMA is above the 50 EMA on the 4H — trend is stacked",
+      "Price has pulled back to within 0.5% of the 20 EMA (tag or close tap)",
+      "The most recent 4H candle closed bullish (close > open) — reclaim after the pullback",
+      "Entry-bar volume is at least 1.2x the 20-bar average volume",
+      "Price is NOT more than 3% extended above the 50 EMA — not buying a climax",
+      "No major news event (CPI/FOMC/NFP/major earnings) within the next 2 hours"
     ],
     "short": [
-      "Price is below VWAP — sellers in control",
-      "Price is below EMA(8) — downtrend confirmed",
-      "RSI(3) has spiked above 70 — overbought in a downtrend, reversal likely"
+      "DISABLED — this account does not short. Spot only. No shorts until the scaling plan clears phase 2."
     ]
   },
 
   "exit_rules": [
-    "Exit when RSI(3) crosses back above 50 (for longs) or below 50 (for shorts)",
-    "Hard stop: 0.3% below entry for longs, 0.3% above entry for shorts",
-    "Take profit at next VWAP touch or EMA(8) cross"
+    "Hard stop: 1x ATR(14) below the swing low that formed during the pullback. Submitted WITH the entry, never adjusted further away.",
+    "First target: 2R (2x the stop distance). Close 50% of the position at 2R and move the stop to breakeven.",
+    "Runner target: 3R OR a 4H close below the 20 EMA, whichever comes first.",
+    "Time stop: if price has not moved at least 0.8x ATR in favour within 5 x 4H bars, exit at the next close.",
+    "Full exit on RSI(14) > 80 on the 4H — treat overbought as a gift, take the profit."
   ],
 
   "risk_rules": [
-    "Risk maximum 1% of portfolio per trade",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
-    "Paper trade first — validate this strategy on your specific asset before going live"
+    "Risk maximum 1.5% of portfolio per trade. On the $5,000 paper account that is $75 per trade.",
+    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env ($500). Bot hard-stops above this.",
+    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env (2). Bot stops itself after 2.",
+    "Daily loss limit: 3% of account = $150 on paper. If hit, close positions and stop trading for the day.",
+    "Weekly loss limit: 7.5% of account = $375 on paper. If hit, stop trading for the week and review every trade.",
+    "ZERO leverage. Spot only. No margin, no perps, no futures. Non-negotiable for 12 months.",
+    "Position sizing formula: size_usd = risk_per_trade_usd / stop_distance_pct. Then cap by MAX_TRADE_SIZE_USD.",
+    "Minimum expected move: 0.8% from entry to first target. Otherwise fees eat the trade.",
+    "Skip the trade if BTC perp funding rate > 0.05%/8h (crowded longs).",
+    "Paper-trade FIRST. Only flip PAPER_TRADING=false after 100 logged paper trades with < 10% rule violations."
   ],
 
-  "notes": "Scalping strategy — designed for 1m to 5m timeframes. RSI(3) is intentionally fast and sensitive. Do not apply to higher timeframes."
+  "forbidden": [
+    "Trading without a pre-submitted stop",
+    "Moving a stop further away after entry",
+    "Revenge trading after a loss",
+    "Adding to a losing position (averaging down)",
+    "Trading during red-flag news (CPI / FOMC / NFP / major earnings within 2h)",
+    "Copying trades from Twitter / Discord / YouTube in real time",
+    "Using leverage or margin on crypto",
+    "Taking a 3rd trade on the same day",
+    "Trading any asset not on the watchlist",
+    "Changing this rulebook mid-session — edits only happen during the weekly review"
+  ],
+
+  "notes": "Strategy ported from the $1000 Learning Account rulebook and the Crypto Synthesis v1 Pine reference, scaled to a $73 USD (~100 CAD) paper-trading pot. Primary objective is SURVIVAL and mechanical execution, not profit. All entries are long-only, spot-only, single pullback-to-20-EMA setup on the 4H BTC chart. Daily runs via Railway every 4 hours. Expected drawdown of 20-40% is normal — do not abandon the system mid-drawdown."
 }
