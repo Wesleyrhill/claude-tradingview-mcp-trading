@@ -582,8 +582,9 @@ async function pushToSheet(logEntry) {
   };
 
   try {
-    // Google Apps Script redirects POST → 302. Follow the redirect manually
-    // so the POST body is preserved (fetch converts POST to GET on 302 by default).
+    // Google Apps Script receives the POST body on the initial request, then
+    // issues a 302 redirect to a GET-only echo URL. Follow the redirect with
+    // GET (standard 302 semantics) — do NOT re-POST the body on the redirect.
     let res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -592,11 +593,7 @@ async function pushToSheet(logEntry) {
     });
     if (res.status === 302) {
       const redirectUrl = res.headers.get("location");
-      res = await fetch(redirectUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
+      res = await fetch(redirectUrl, { method: "GET" });
     }
     const body = await res.text();
     if (res.ok) {
