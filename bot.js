@@ -280,13 +280,13 @@ function runSafetyCheck(ctx, rules) {
     ema20 > ema50,
   );
 
-  // 3. Price within 0.5% of 20 EMA (pullback tag)
+  // 3. Price within 2.5% of 20 EMA (pullback tag — relaxed for paper-trade observation)
   const distFrom20 = Math.abs((price - ema20) / ema20) * 100;
   check(
-    "Price within 0.5% of the 20 EMA (pullback tag)",
-    "≤ 0.5%",
+    "Price within 2.5% of the 20 EMA (pullback tag — relaxed threshold)",
+    "≤ 2.5%",
     `${distFrom20.toFixed(3)}%`,
-    distFrom20 <= 0.5,
+    distFrom20 <= 2.5,
   );
 
   // 4. Last 4H candle closed bullish
@@ -297,13 +297,13 @@ function runSafetyCheck(ctx, rules) {
     lastCandle.close > lastCandle.open,
   );
 
-  // 5. Volume >= 1.2x 20-bar average
+  // 5. Volume >= 0.5x 20-bar average (relaxed for paper-trade observation)
   const volRatio = lastCandle.volume / vol20avg;
   check(
-    "Entry-bar volume ≥ 1.2× the 20-bar average",
-    "≥ 1.2×",
+    "Entry-bar volume ≥ 0.5× the 20-bar average (relaxed threshold)",
+    "≥ 0.5×",
     `${volRatio.toFixed(2)}×`,
-    volRatio >= 1.2,
+    volRatio >= 0.5,
   );
 
   // 6. Price NOT more than 3% extended above the 50 EMA
