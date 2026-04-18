@@ -99,10 +99,8 @@ const CONFIG = {
 // ─── Startup config validation ──────────────────────────────────────────────
 
 if (!process.env.RISK_PER_TRADE_PCT) {
-  console.warn(
-    "[WARN] RISK_PER_TRADE_PCT is not set in the environment. " +
-    "Defaulting to 1.5% risk per trade. " +
-    "Set RISK_PER_TRADE_PCT in your Railway environment variables to silence this warning."
+  console.log(
+    "[INFO] RISK_PER_TRADE_PCT not set — using default 1.5% risk per trade."
   );
 }
 
@@ -587,10 +585,14 @@ async function pushToSheet(logEntry) {
     // GET (standard 302 semantics) — do NOT re-POST the body on the redirect.
     let res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
       body: JSON.stringify(payload),
       redirect: "manual",
     });
+    console.log(`[sheet-push] initial POST status: ${res.status}`);
     if (res.status === 302) {
       const redirectUrl = res.headers.get("location");
       res = await fetch(redirectUrl, { method: "GET" });
