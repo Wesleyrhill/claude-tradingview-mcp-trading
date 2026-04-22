@@ -16,6 +16,8 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import twilio from "twilio";
+import nodemailer from "nodemailer";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -655,6 +657,116 @@ function generateTaxSummary() {
   console.log("─────────────────────────────────────────────────────────\n");
 }
 
+// ─── Trade Alerts (email + SMS) ──────────────────────────────────────────────
+// Fires only when a paper trade is actually entered (allPass + paperTrading).
+// Both channels are attempted in parallel; a failure in either is logged but
+// never allowed to crash the bot.
+
+function buildAlertText(d) {
+  const stopPct  = ((d.price - d.stopPrice) / d.price * 100).toFixed(2);
+  const feePct   = (COINBASE_MAKER_FEE_PCT * 100).toFixed(2);
+
+  return [
+    `BTC PAPER TRADE ENTERED`,
+    ``,
+    `Entry price : $${d.price.toFixed(2)}`,
+    `Position    : $${d.sizeUSD.toFixed(2)}`,
+    `Stop loss   : $${d.stopPrice.toFixed(2)}  (-${stopPct}%)`,
+    `Target 1    : $${d.target1Price.toFixed(2)}`,
+    `Target 2    : $${d.target2Price.toFixed(2)}`,
+    ``,
+    `── Projected net P&L (after Coinbase ${feePct}% maker fee) ──`,
+    `  At stop : $${d.pnl.atStop.net.toFixed(2)}`,
+    `  At T1   : $${d.pnl.atTarget1.net.toFixed(2)}`,
+    `  At T2   : $${d.pnl.atTarget2.net.toFixed(2)}`,
+    ``,
+    `── Indicators ──`,
+    `  RSI(14)  : ${d.rsi14.toFixed(2)}`,
+    `  EMA(20)  : $${d.ema20.toFixed(2)}`,
+    `  EMA(50)  : $${d.ema50.toFixed(2)}`,
+    ``,
+    `Timestamp: ${d.timestamp}`,
+  ].join("\n");
+}
+
+async function sendSmsAlert(text) {
+  const sid   = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  const from  = process.env.TWILIO_FROM_NUMBER;
+  const to    = process.env.ALERT_PHONE;
+
+  if (!sid || !token || !from || !to ||
+      sid.startsWith("your_") || token.startsWith("your_")) {
+    console.log("[alerts] Twilio credentials not configured — SMS skipped.");
+    return;
+  }
+
+  const client = twilio(sid, token);
+  // Twilio SMS has a 1600-char limit; trim gracefully
+  const body = text.length > 1550 ? text.slice(0, 1547) + "..." : text;
+  const msg = await client.messages.create({ body, from, to });
+  console.log(`[alerts] SMS sent — SID ${msg.sid}`);
+}
+
+async function sendEmailAlert(subject, text) {
+  const user     = process.env.GMAIL_USER;
+  const password = process.env.GMAIL_APP_PASSWORD;
+  const to       = process.env.ALERT_EMAIL;
+
+  if (!user || !password || !to ||
+      password.startsWith("your_")) {
+    console.log("[alerts] Gmail credentials not configured — email skipped.");
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user, pass: password },
+  });
+
+  const info = await transporter.sendMail({
+    from: `"Trading Bot" <${user}>`,
+    to,
+    subject,
+    text,
+  });
+  console.log(`[alerts] Email sent — messageId ${info.messageId}`);
+}
+
+async function sendAlerts(logEntry) {
+  const { price, tradeSize, stopPrice, target1Price, target2Price,
+          projectedPnl, indicators, timestamp } = logEntry;
+
+  const data = {
+    timestamp,
+    price,
+    sizeUSD        : tradeSize,
+    stopPrice,
+    target1Price,
+    target2Price,
+    pnl            : projectedPnl,
+    rsi14          : indicators.rsi14,
+    ema20          : indicators.ema20,
+    ema50          : indicators.ema50,
+  };
+
+  const text    = buildAlertText(data);
+  const subject = `BTC Trade Signal — Entry $${price.toFixed(2)}`;
+
+  console.log("[alerts] Sending trade alerts (email + SMS)...");
+
+  const results = await Promise.allSettled([
+    sendEmailAlert(subject, text),
+    sendSmsAlert(text),
+  ]);
+
+  for (const r of results) {
+    if (r.status === "rejected") {
+      console.log(`[alerts] Alert delivery error: ${r.reason?.message || r.reason}`);
+    }
+  }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 // ─── Canary Check ────────────────────────────────────────────────────────────
@@ -850,6 +962,9 @@ async function run() {
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
+
+      // Fire email + SMS alerts non-blocking — errors are caught inside sendAlerts
+      await sendAlerts(logEntry);
     } else {
       console.log(
         `\n🔴 PLACING LIVE ORDER — $${sizing.sizeUSD.toFixed(2)} BUY ${CONFIG.symbol}`,
