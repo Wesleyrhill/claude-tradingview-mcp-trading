@@ -40,7 +40,7 @@
     "long": [
       "Price is above the 50 EMA on the 4H — uptrend confirmed",
       "The 20 EMA is above the 50 EMA on the 4H — trend is stacked",
-      "Price has pulled back to within 0.5% of the 20 EMA (tag or close tap)",
+      "Price has pulled back to within 5% of the 20 EMA (widened threshold for more signals)",
       "The most recent 4H candle closed bullish (close > open) — reclaim after the pullback",
       "Entry-bar volume is at least 1.2x the 20-bar average volume",
       "Price is NOT more than 3% extended above the 50 EMA — not buying a climax",
@@ -52,7 +52,7 @@
   },
 
   "exit_rules": [
-    "Hard stop: 1x ATR(14) below the swing low that formed during the pullback. Submitted WITH the entry, never adjusted further away.",
+    "Hard stop: 3.5% below entry price. Submitted WITH the entry, never adjusted further away.",
     "First target: 2R (2x the stop distance). Close 50% of the position at 2R and move the stop to breakeven.",
     "Runner target: 3R OR a 4H close below the 20 EMA, whichever comes first.",
     "Time stop: if price has not moved at least 0.8x ATR in favour within 5 x 4H bars, exit at the next close.",
@@ -61,8 +61,8 @@
 
   "risk_rules": [
     "Risk maximum 1.5% of portfolio per trade. On the $5,000 paper account that is $75 per trade.",
-    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env ($500). Bot hard-stops above this.",
-    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env (2). Bot stops itself after 2.",
+    "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env ($5,000 — full portfolio). Bot hard-stops above this.",
+    "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env (5). Bot stops itself after 5.",
     "Daily loss limit: 3% of account = $150 on paper. If hit, close positions and stop trading for the day.",
     "Weekly loss limit: 7.5% of account = $375 on paper. If hit, stop trading for the week and review every trade.",
     "ZERO leverage. Spot only. No margin, no perps, no futures. Non-negotiable for 12 months.",

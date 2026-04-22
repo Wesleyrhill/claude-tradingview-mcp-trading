@@ -82,12 +82,13 @@ function checkOnboarding() {
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
   timeframe: process.env.TIMEFRAME || "4H",
-  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
-  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
-  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
+  portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "5000"),
+  maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "5000"),
+  maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "5"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
   riskPerTradePct: parseFloat(process.env.RISK_PER_TRADE_PCT || "1.5"),
+  stopLossPct: parseFloat(process.env.STOP_LOSS_PCT || "3.5"),
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
     secretKey: process.env.BITGET_SECRET_KEY,
@@ -280,13 +281,13 @@ function runSafetyCheck(ctx, rules) {
     ema20 > ema50,
   );
 
-  // 3. Price within 2.5% of 20 EMA (pullback tag — relaxed for paper-trade observation)
+  // 3. Price within 5% of 20 EMA (pullback tag — widened for more signal generation)
   const distFrom20 = Math.abs((price - ema20) / ema20) * 100;
   check(
-    "Price within 2.5% of the 20 EMA (pullback tag — relaxed threshold)",
-    "≤ 2.5%",
+    "Price within 5% of the 20 EMA (pullback tag — widened threshold for more trades)",
+    "≤ 5%",
     `${distFrom20.toFixed(3)}%`,
-    distFrom20 <= 2.5,
+    distFrom20 <= 5,
   );
 
   // 4. Last 4H candle closed bullish
@@ -353,9 +354,10 @@ function checkTradeLimits(log) {
 
 function sizePosition(price, atr) {
   const riskDollars = CONFIG.portfolioValue * (CONFIG.riskPerTradePct / 100);
-  const stopPrice = price - atr; // 1x ATR below entry
-  const stopDistance = price - stopPrice;
-  const stopDistancePct = (stopDistance / price) * 100;
+  // Fixed stop-loss percentage (3.5%) — ignores ATR to keep risk consistent
+  const stopDistancePct = CONFIG.stopLossPct;
+  const stopDistance = price * (stopDistancePct / 100);
+  const stopPrice = price - stopDistance;
 
   // size in USD such that (sizeUSD * stopDistance / price) == riskDollars
   // i.e. sizeUSD = riskDollars * price / stopDistance
