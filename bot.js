@@ -79,6 +79,11 @@ function checkOnboarding() {
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+// Coinbase Advanced Trade maker fee (limit orders, base tier < $10k/mo volume).
+// Round-trip cost = 2 × COINBASE_MAKER_FEE_PCT (entry + exit).
+// Override at runtime with COINBASE_FEE_PCT env var.
+const COINBASE_MAKER_FEE_PCT = parseFloat(process.env.COINBASE_FEE_PCT || "0.004");
+
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
   timeframe: process.env.TIMEFRAME || "4H",
@@ -484,16 +489,20 @@ function writeTradeCsv(logEntry) {
     side = "BUY";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
+    // Entry fee only (exit fee is captured in projected P&L fields)
+    fee = (logEntry.entryFee || logEntry.tradeSize * COINBASE_MAKER_FEE_PCT).toFixed(4);
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "PAPER";
-    notes = `All conditions met | stop $${logEntry.stopPrice.toFixed(2)} | T1 $${logEntry.target1Price.toFixed(2)} | T2 $${logEntry.target2Price.toFixed(2)}`;
+    const pnlNote = logEntry.projectedPnl
+      ? ` | net P&L@stop $${logEntry.projectedPnl.atStop.net.toFixed(2)} | net P&L@T1 $${logEntry.projectedPnl.atTarget1.net.toFixed(2)} | net P&L@T2 $${logEntry.projectedPnl.atTarget2.net.toFixed(2)}`
+      : "";
+    notes = `All conditions met | stop $${logEntry.stopPrice.toFixed(2)} | T1 $${logEntry.target1Price.toFixed(2)} | T2 $${logEntry.target2Price.toFixed(2)}${pnlNote}`;
   } else {
     side = "BUY";
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
+    fee = (logEntry.entryFee || logEntry.tradeSize * COINBASE_MAKER_FEE_PCT).toFixed(4);
     netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
     orderId = logEntry.orderId || "";
     mode = "LIVE";
@@ -579,6 +588,15 @@ async function pushToSheet(logEntry) {
     portfolioValue: CONFIG.portfolioValue.toFixed(2),
     maxTradeSize: CONFIG.maxTradeSizeUSD.toFixed(2),
     tradesToday: logEntry.limits.tradesToday,
+    // Fee fields (Coinbase Advanced Trade maker fee)
+    feePct: (COINBASE_MAKER_FEE_PCT * 100).toFixed(2),
+    entryFee: logEntry.entryFee?.toFixed(4) || "",
+    projNetPnlAtStop: logEntry.projectedPnl?.atStop.net.toFixed(2) || "",
+    projGrossPnlAtStop: logEntry.projectedPnl?.atStop.gross.toFixed(2) || "",
+    projNetPnlAtT1: logEntry.projectedPnl?.atTarget1.net.toFixed(2) || "",
+    projGrossPnlAtT1: logEntry.projectedPnl?.atTarget1.gross.toFixed(2) || "",
+    projNetPnlAtT2: logEntry.projectedPnl?.atTarget2.net.toFixed(2) || "",
+    projGrossPnlAtT2: logEntry.projectedPnl?.atTarget2.gross.toFixed(2) || "",
   };
 
   try {
@@ -775,6 +793,9 @@ async function run() {
     orderPlaced: false,
     orderId: null,
     paperTrading: CONFIG.paperTrading,
+    // Fee tracking (Coinbase Advanced Trade maker fee — set on entry if trade fires)
+    entryFee: null,
+    projectedPnl: null,
     limits: {
       maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
       maxTradesPerDay: CONFIG.maxTradesPerDay,
@@ -790,12 +811,42 @@ async function run() {
     console.log(`✅ ALL CONDITIONS MET`);
 
     if (CONFIG.paperTrading) {
+      // ── Fee-adjusted P&L projections ────────────────────────────────────────
+      // Entry fee: paid when the position is opened.
+      // Exit fee: paid on the closing fill (stop, T1, or T2). Calculated on
+      //   the exit value (quantity × exit price) rather than original size,
+      //   because price will differ at each exit point.
+      const entryFee = sizing.sizeUSD * COINBASE_MAKER_FEE_PCT;
+      const qty = sizing.sizeUSD / price; // BTC quantity
+
+      function calcScenarioPnl(exitPrice) {
+        const exitValue = qty * exitPrice;
+        const exitFee = exitValue * COINBASE_MAKER_FEE_PCT;
+        const grossPnl = exitValue - sizing.sizeUSD;
+        const netPnl = grossPnl - entryFee - exitFee;
+        return { gross: grossPnl, net: netPnl, exitFee };
+      }
+
+      const projectedPnl = {
+        atStop:    calcScenarioPnl(sizing.stopPrice),
+        atTarget1: calcScenarioPnl(sizing.target1Price),
+        atTarget2: calcScenarioPnl(sizing.target2Price),
+      };
+
+      logEntry.entryFee = entryFee;
+      logEntry.projectedPnl = projectedPnl;
+
       console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${sizing.sizeUSD.toFixed(2)} (${(sizing.sizeUSD / price).toFixed(6)} BTC) at market`,
+        `\nPAPER TRADE — would buy ${CONFIG.symbol} ~$${sizing.sizeUSD.toFixed(2)} (${(sizing.sizeUSD / price).toFixed(6)} BTC) at market`,
       );
       console.log(
         `   Stop: $${sizing.stopPrice.toFixed(2)} | T1: $${sizing.target1Price.toFixed(2)} | T2: $${sizing.target2Price.toFixed(2)}`,
       );
+      console.log(`\n── Fee-Adjusted P&L Projections (Coinbase maker ${(COINBASE_MAKER_FEE_PCT * 100).toFixed(2)}%) ──`);
+      console.log(`   Entry fee:                  $${entryFee.toFixed(4)}`);
+      console.log(`   At stop  ($${sizing.stopPrice.toFixed(2)}):  gross $${projectedPnl.atStop.gross.toFixed(2)}  exit fee $${projectedPnl.atStop.exitFee.toFixed(4)}  NET $${projectedPnl.atStop.net.toFixed(2)}`);
+      console.log(`   At T1    ($${sizing.target1Price.toFixed(2)}):  gross $${projectedPnl.atTarget1.gross.toFixed(2)}  exit fee $${projectedPnl.atTarget1.exitFee.toFixed(4)}  NET $${projectedPnl.atTarget1.net.toFixed(2)}`);
+      console.log(`   At T2    ($${sizing.target2Price.toFixed(2)}):  gross $${projectedPnl.atTarget2.gross.toFixed(2)}  exit fee $${projectedPnl.atTarget2.exitFee.toFixed(4)}  NET $${projectedPnl.atTarget2.net.toFixed(2)}`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
