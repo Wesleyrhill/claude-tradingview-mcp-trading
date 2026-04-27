@@ -720,7 +720,10 @@ async function sendEmailAlert(subject, text) {
   }
 
   const transporter = nodemailer.createTransport({
-    service: "gmail",
+    host: "smtp.gmail.com",
+    port: 465,
+    secure: true,
+    family: 4,           // force IPv4 — Railway IPv6 → Gmail is broken (ENETUNREACH)
     auth: { user, pass: password },
   });
 
