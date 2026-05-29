@@ -132,6 +132,54 @@ function countTodaysTrades(log) {
   ).length;
 }
 
+function getOrInitPaperBalance(log) {
+  if (log.paperBalance == null) log.paperBalance = CONFIG.portfolioValue;
+  if (log.initialPaperBalance == null) log.initialPaperBalance = log.paperBalance;
+  if (!log.openPaperPositions) log.openPaperPositions = [];
+  return log.paperBalance;
+}
+
+function getPaperPnl(log) {
+  const initial = log.initialPaperBalance ?? CONFIG.portfolioValue;
+  const current = log.paperBalance ?? initial;
+  const net = current - initial;
+  const pct = (net / initial) * 100;
+  return { net, pct, initial, current };
+}
+
+function checkOpenPaperPositions(log, candles) {
+  if (!log.openPaperPositions?.length) return;
+
+  const { high, low } = candles[candles.length - 1];
+  const stillOpen = [];
+
+  for (const pos of log.openPaperPositions) {
+    if (low <= pos.stopPrice) {
+      const exitFee = pos.qty * pos.stopPrice * COINBASE_MAKER_FEE_PCT;
+      const pnl = pos.qty * pos.stopPrice - pos.sizeUSD - pos.entryFee - exitFee;
+      log.paperBalance += pos.sizeUSD + pnl;
+      console.log(`[paper-exit] ${pos.orderId} STOPPED at $${pos.stopPrice.toFixed(2)} | net P&L $${pnl.toFixed(2)} | balance → $${log.paperBalance.toFixed(2)}`);
+    } else if (high >= pos.target2Price) {
+      const exitFee = pos.qty * pos.target2Price * COINBASE_MAKER_FEE_PCT;
+      const pnl = pos.qty * pos.target2Price - pos.sizeUSD - pos.entryFee - exitFee;
+      log.paperBalance += pos.sizeUSD + pnl;
+      console.log(`[paper-exit] ${pos.orderId} T2 at $${pos.target2Price.toFixed(2)} | net P&L $${pnl.toFixed(2)} | balance → $${log.paperBalance.toFixed(2)}`);
+    } else if (!pos.halfExited && high >= pos.target1Price) {
+      const halfQty = pos.qty / 2;
+      const exitFee = halfQty * pos.target1Price * COINBASE_MAKER_FEE_PCT;
+      const halfCost = pos.sizeUSD / 2;
+      const pnl = halfQty * pos.target1Price - halfCost - pos.entryFee / 2 - exitFee;
+      log.paperBalance += halfCost + pnl;
+      console.log(`[paper-exit] ${pos.orderId} T1 at $${pos.target1Price.toFixed(2)} | half P&L $${pnl.toFixed(2)} | runner open to T2 (stop → BE) | balance → $${log.paperBalance.toFixed(2)}`);
+      stillOpen.push({ ...pos, qty: halfQty, sizeUSD: halfCost, entryFee: pos.entryFee / 2, stopPrice: pos.entryPrice, halfExited: true });
+    } else {
+      stillOpen.push(pos);
+    }
+  }
+
+  log.openPaperPositions = stillOpen;
+}
+
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
 
 async function fetchCandles(symbol, interval, limit = 200) {
@@ -436,6 +484,42 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   return data.data;
 }
 
+async function fetchBitgetBalance() {
+  try {
+    const timestamp = Date.now().toString();
+    const path = "/api/v2/spot/account/assets";
+    const signature = signBitGet(timestamp, "GET", path);
+
+    const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
+      method: "GET",
+      headers: {
+        "ACCESS-KEY": CONFIG.bitget.apiKey,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": CONFIG.bitget.passphrase,
+      },
+    });
+
+    const data = await res.json();
+    if (data.code !== "00000") {
+      console.warn(`[balance] BitGet: ${data.msg}`);
+      return null;
+    }
+
+    const usdt = (data.data || []).find((a) => a.coin === "USDT");
+    if (!usdt) return null;
+
+    return {
+      available: parseFloat(usdt.available),
+      frozen: parseFloat(usdt.frozen || "0"),
+      total: parseFloat(usdt.available) + parseFloat(usdt.frozen || "0"),
+    };
+  } catch (err) {
+    console.warn(`[balance] fetch failed: ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Tax CSV Logging ─────────────────────────────────────────────────────────
 
 const CSV_FILE = "trades.csv";
@@ -535,15 +619,109 @@ function writeTradeCsv(logEntry) {
   console.log(`Tax record saved → ${CSV_FILE}`);
 }
 
-// ─── Google Sheets Webhook ──────────────────────────────────────────────────
+// ─── Webhook delivery helpers ────────────────────────────────────────────────
+const DELIVERY_TIMEOUT_MS = 8000;
+const DELIVERY_RETRIES = 3;
+const DELIVERY_BACKOFF_MS = 1200;
 
-async function pushToSheet(logEntry) {
-  const url = process.env.LOG_WEBHOOK_URL;
+const sentKeys = new Set();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildDecisionKey(p) {
+  return [
+    p.timestamp,
+    p.symbol,
+    p.timeframe,
+    p.side,
+    p.decision,
+    p.orderId || "no-order",
+  ].join("|");
+}
+
+async function postJsonWithRetry(url, payload, headers = {}, label = "webhook") {
   if (!url) {
-    console.log("(No LOG_WEBHOOK_URL set — skipping Sheet push)");
-    return;
+    console.warn(`[${label}] URL missing, skipping`);
+    return { ok: false, skipped: true, reason: "missing_url" };
   }
 
+  for (let attempt = 1; attempt <= DELIVERY_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+      const body = await res.text().catch(() => "");
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText} | ${body.slice(0, 300)}`);
+      }
+
+      console.log(`[${label}] delivered (attempt ${attempt})`);
+      return { ok: true, status: res.status, body };
+    } catch (err) {
+      clearTimeout(timeout);
+      const finalAttempt = attempt === DELIVERY_RETRIES;
+      console.warn(`[${label}] attempt ${attempt} failed: ${err.message}`);
+
+      if (finalAttempt) {
+        return { ok: false, error: err.message };
+      }
+
+      await sleep(DELIVERY_BACKOFF_MS * attempt);
+    }
+  }
+}
+
+// Google Apps Script issues a 302 after POST — follow it with GET (do NOT re-POST)
+async function postToGoogleSheet(url, payload) {
+  if (!url) {
+    console.log("(No SHEET_WEBHOOK_URL set — skipping Sheet push)");
+    return { ok: false, skipped: true };
+  }
+  try {
+    let res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      body: JSON.stringify(payload),
+      redirect: "manual",
+    });
+    console.log(`[sheet-push] initial POST status: ${res.status}`);
+    if (res.status === 302) {
+      const redirectUrl = res.headers.get("location");
+      res = await fetch(redirectUrl, { method: "GET" });
+    }
+    const body = await res.text();
+    if (res.ok) {
+      console.log(`Sheet push ✓ (${body.slice(0, 60)})`);
+      return { ok: true };
+    } else {
+      console.log(`⚠️  Sheet push failed: HTTP ${res.status}`);
+      return { ok: false, error: `HTTP ${res.status}` };
+    }
+  } catch (err) {
+    console.log(`⚠️  Sheet push error: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ─── Hermes webhook subscribe: trading-bot ───────────────────────────────────
+async function pushToSheet(logEntry) {
   const failed = logEntry.conditions
     .filter((c) => !c.pass)
     .map((c) => c.label)
@@ -564,7 +742,8 @@ async function pushToSheet(logEntry) {
     decision = "TRADED";
   }
 
-  const payload = {
+  // Flat payload the Apps Script expects (column-for-column same as before)
+  const sheetPayload = {
     timestamp: logEntry.timestamp,
     symbol: logEntry.symbol,
     timeframe: logEntry.timeframe,
@@ -590,7 +769,8 @@ async function pushToSheet(logEntry) {
     portfolioValue: CONFIG.portfolioValue.toFixed(2),
     maxTradeSize: CONFIG.maxTradeSizeUSD.toFixed(2),
     tradesToday: logEntry.limits.tradesToday,
-    // Fee fields (Coinbase Advanced Trade maker fee)
+    conditionsPassed: logEntry.conditionsPassed,
+    failedConditionIds: JSON.stringify(logEntry.failedConditionIds || []),
     feePct: (COINBASE_MAKER_FEE_PCT * 100).toFixed(2),
     entryFee: logEntry.entryFee?.toFixed(4) || "",
     projNetPnlAtStop: logEntry.projectedPnl?.atStop.net.toFixed(2) || "",
@@ -599,35 +779,60 @@ async function pushToSheet(logEntry) {
     projGrossPnlAtT1: logEntry.projectedPnl?.atTarget1.gross.toFixed(2) || "",
     projNetPnlAtT2: logEntry.projectedPnl?.atTarget2.net.toFixed(2) || "",
     projGrossPnlAtT2: logEntry.projectedPnl?.atTarget2.gross.toFixed(2) || "",
+    realBalanceUSD: logEntry.realBalanceUSD != null ? logEntry.realBalanceUSD.toFixed(2) : "",
+    paperBalanceUSD: logEntry.paperBalanceUSD != null ? logEntry.paperBalanceUSD.toFixed(2) : "",
+    openPaperPositions: logEntry.openPaperPositions?.toString() ?? "0",
+    totalPnlUSD: logEntry.totalPnlUSD != null ? logEntry.totalPnlUSD.toFixed(2) : "",
+    totalPnlPct: logEntry.totalPnlPct != null ? logEntry.totalPnlPct.toFixed(2) : "",
   };
 
-  try {
-    // Google Apps Script receives the POST body on the initial request, then
-    // issues a 302 redirect to a GET-only echo URL. Follow the redirect with
-    // GET (standard 302 semantics) — do NOT re-POST the body on the redirect.
-    let res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-      body: JSON.stringify(payload),
-      redirect: "manual",
-    });
-    console.log(`[sheet-push] initial POST status: ${res.status}`);
-    if (res.status === 302) {
-      const redirectUrl = res.headers.get("location");
-      res = await fetch(redirectUrl, { method: "GET" });
-    }
-    const body = await res.text();
-    if (res.ok) {
-      console.log(`Sheet push ✓ (${body.slice(0, 60)})`);
-    } else {
-      console.log(`⚠️  Sheet push failed: HTTP ${res.status}`);
-    }
-  } catch (err) {
-    console.log(`⚠️  Sheet push error: ${err.message}`);
+  // Full normalized payload for Hermes
+  const normalized = {
+    ...logEntry,
+    decision,
+    source: "binance-cron-bot",
+    receivedAt: new Date().toISOString(),
+  };
+
+  const key = buildDecisionKey(normalized);
+  if (sentKeys.has(key)) {
+    console.log(`[dedupe] already sent: ${key}`);
+    return { ok: true, deduped: true };
   }
+
+  const sheetUrl = process.env.SHEET_WEBHOOK_URL;
+  const hermesUrl = process.env.HERMES_WEBHOOK_URL;
+  const hermesSecret = process.env.HERMES_WEBHOOK_SECRET;
+
+  const [sheetRes, hermesRes] = await Promise.allSettled([
+    postToGoogleSheet(sheetUrl, sheetPayload),
+    postJsonWithRetry(
+      hermesUrl,
+      normalized,
+      hermesSecret ? { "X-Webhook-Secret": hermesSecret } : {},
+      "hermes"
+    ),
+  ]);
+
+  const sheet = sheetRes.status === "fulfilled" ? sheetRes.value : { ok: false, error: sheetRes.reason?.message || "unknown" };
+  const hermes = hermesRes.status === "fulfilled" ? hermesRes.value : { ok: false, error: hermesRes.reason?.message || "unknown" };
+
+  if (sheet.ok || hermes.ok) {
+    sentKeys.add(key);
+  }
+
+  if (sentKeys.size > 5000) {
+    const first = sentKeys.values().next().value;
+    sentKeys.delete(first);
+  }
+
+  if (!sheet.ok || !hermes.ok) {
+    console.warn("[delivery] partial failure", { sheet, hermes });
+  } else {
+    console.log("[delivery] both sinks ok");
+  }
+
+  return { ok: sheet.ok || hermes.ok, sheet, hermes };
 }
 
 function generateTaxSummary() {
@@ -835,6 +1040,22 @@ async function run() {
     return;
   }
 
+  // Fetch real BitGet balance and initialise paper balance tracker
+  const [realBalance] = await Promise.all([fetchBitgetBalance()]);
+  const paperBalance = getOrInitPaperBalance(log);
+
+  console.log("\n── Portfolio ─────────────────────────────────────────────\n");
+  if (realBalance) {
+    console.log(`  Real BitGet USDT : $${realBalance.total.toFixed(2)}  (available $${realBalance.available.toFixed(2)}, frozen $${realBalance.frozen.toFixed(2)})`);
+  } else {
+    console.log(`  Real BitGet USDT : unavailable`);
+  }
+  const pnl = getPaperPnl(log);
+  const pnlSign = pnl.net >= 0 ? "+" : "";
+  console.log(`  Paper portfolio  : $${paperBalance.toFixed(2)}  (open positions: ${log.openPaperPositions.length})`);
+  console.log(`  Total P&L        : ${pnlSign}$${pnl.net.toFixed(2)}  (${pnlSign}${pnl.pct.toFixed(2)}%)  since start $${pnl.initial.toFixed(2)}`);
+  console.log(`  Config base      : $${CONFIG.portfolioValue.toFixed(2)}`);
+
   // Fetch candle data — need enough for EMA(50) + ATR(14) + 20-bar volume
   console.log("\n── Fetching market data from Binance ───────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 200);
@@ -846,6 +1067,9 @@ async function run() {
     console.log("⚠️  Not enough candles to evaluate. Exiting.");
     return;
   }
+
+  // Settle any open paper positions against the latest closed candle
+  if (CONFIG.paperTrading) checkOpenPaperPositions(log, candles);
 
   // Calculate indicators
   const ema20 = calcEMA(closes, 20);
@@ -901,6 +1125,8 @@ async function run() {
     indicators: { ema20, ema50, atr, rsi14, vol20avg, volumeLast: lastCandle.volume },
     conditions: results,
     allPass,
+    conditionsPassed: allPass,
+    failedConditionIds: results.reduce((acc, r, i) => { if (!r.pass) acc.push(i + 1); return acc; }, []),
     tradeSize: sizing.sizeUSD,
     stopPrice: sizing.stopPrice,
     target1Price: sizing.target1Price,
@@ -916,6 +1142,12 @@ async function run() {
       maxTradesPerDay: CONFIG.maxTradesPerDay,
       tradesToday: countTodaysTrades(log),
     },
+    // Portfolio snapshot at decision time
+    realBalanceUSD: realBalance ? realBalance.total : null,
+    paperBalanceUSD: log.paperBalance,
+    openPaperPositions: log.openPaperPositions.length,
+    totalPnlUSD: getPaperPnl(log).net,
+    totalPnlPct: getPaperPnl(log).pct,
   };
 
   if (!allPass) {
@@ -965,6 +1197,24 @@ async function run() {
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
+
+      // Track open paper position and deduct committed capital from paper balance
+      log.openPaperPositions.push({
+        orderId: logEntry.orderId,
+        entryPrice: price,
+        sizeUSD: sizing.sizeUSD,
+        qty: sizing.sizeUSD / price,
+        stopPrice: sizing.stopPrice,
+        target1Price: sizing.target1Price,
+        target2Price: sizing.target2Price,
+        entryFee: logEntry.entryFee,
+        openedAt: logEntry.timestamp,
+        halfExited: false,
+      });
+      log.paperBalance -= sizing.sizeUSD;
+      logEntry.paperBalanceUSD = log.paperBalance;
+      logEntry.openPaperPositions = log.openPaperPositions.length;
+      console.log(`[paper-balance] committed $${sizing.sizeUSD.toFixed(2)} → balance $${log.paperBalance.toFixed(2)}`);
 
       // Fire email + SMS alerts non-blocking — errors are caught inside sendAlerts
       await sendAlerts(logEntry);
