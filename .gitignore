@@ -3,3 +3,8 @@
 safety-check-log.json
 trades.csv
 node_modules/
+
+# Signal bot (signals/) — runtime state and local overrides
+signals/signal-state.json
+signals/signal-state.json.tmp
+signals/.env

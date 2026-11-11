@@ -1,0 +1,52 @@
+{
+  "account": {
+    "sizeUsd": 1000,
+    "riskPct": 1.5,
+    "maxPositionPct": 35,
+    "maxOpenPositions": 3,
+    "maxNewEntriesPerDay": 2
+  },
+  "digest": {
+    "enabled": true,
+    "localHour": 8,
+    "timeZone": "America/Halifax"
+  },
+  "classes": {
+    "crypto": {
+      "source": "kraken",
+      "timeframe": "4h",
+      "pullbackPct": 1.5,
+      "volMult": 1.0,
+      "maxExtPct": 5,
+      "rsiMax": 75,
+      "rsiExit": 80,
+      "atrMult": 1,
+      "minStopPct": 1.5,
+      "maxStopPct": 5,
+      "timeStopBars": 5
+    },
+    "stocks": {
+      "source": "yahoo",
+      "timeframe": "1d",
+      "pullbackPct": 1.0,
+      "volMult": 1.0,
+      "maxExtPct": 8,
+      "rsiMax": 75,
+      "rsiExit": 80,
+      "atrMult": 1,
+      "minStopPct": 1.5,
+      "maxStopPct": 6,
+      "timeStopBars": 5
+    }
+  },
+  "assets": [
+    { "symbol": "BTC", "class": "crypto", "feed": "XBTUSD", "tv": "KRAKEN:BTCUSD" },
+    { "symbol": "ETH", "class": "crypto", "feed": "ETHUSD", "tv": "KRAKEN:ETHUSD" },
+    { "symbol": "SOL", "class": "crypto", "feed": "SOLUSD", "tv": "KRAKEN:SOLUSD" },
+    { "symbol": "SPY", "class": "stocks", "feed": "SPY", "tv": "AMEX:SPY" },
+    { "symbol": "QQQ", "class": "stocks", "feed": "QQQ", "tv": "NASDAQ:QQQ" },
+    { "symbol": "AAPL", "class": "stocks", "feed": "AAPL", "tv": "NASDAQ:AAPL" },
+    { "symbol": "MSFT", "class": "stocks", "feed": "MSFT", "tv": "NASDAQ:MSFT" },
+    { "symbol": "NVDA", "class": "stocks", "feed": "NVDA", "tv": "NASDAQ:NVDA" }
+  ]
+}

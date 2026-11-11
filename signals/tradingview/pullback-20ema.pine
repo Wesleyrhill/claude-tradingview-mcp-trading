@@ -1,0 +1,38 @@
+//@version=6
+// Mirrors signals/lib.js so the triangles on your TradingView chart are the same setups the bot pings.
+// Defaults match the "crypto" block in watchlist.json (use on a 4H chart).
+// For stocks (daily chart) set: pullback 1.0, max extension 8, max stop 6.
+indicator("Pullback to 20 EMA (signal-bot)", shorttitle="PB20", overlay=true)
+
+pullbackPct = input.float(1.5, "Pullback: low within % of 20 EMA", step=0.1)
+volMult     = input.float(1.0, "Volume at least x average", step=0.1)
+maxExtPct   = input.float(5.0, "Max % above 50 EMA", step=0.5)
+rsiMax      = input.float(75, "Max RSI at entry")
+atrMult     = input.float(1.0, "Stop: ATR below swing low", step=0.1)
+minStopPct  = input.float(1.5, "Min stop %", step=0.1)
+maxStopPct  = input.float(5.0, "Max stop %", step=0.1)
+
+e20 = ta.ema(close, 20)
+e50 = ta.ema(close, 50)
+r   = ta.rsi(close, 14)
+a   = ta.atr(14)
+volAvg = ta.sma(volume, 20)[1]
+extPct = (close - e50) / e50 * 100
+
+volOk = na(volAvg) or volAvg == 0 or volume >= volMult * volAvg
+setup = close > e50 and e20 > e50 and low <= e20 * (1 + pullbackPct / 100) and close >= e20 and close > open and volOk and extPct <= maxExtPct and r < rsiMax
+
+swing      = ta.lowest(low, 5)
+rawStopPct = (close - (swing - atrMult * a)) / close * 100
+stopPct    = math.min(math.max(rawStopPct, minStopPct), maxStopPct)
+stopPrice  = close * (1 - stopPct / 100)
+riskAmt    = close - stopPrice
+
+plot(e20, "20 EMA", color=color.orange)
+plot(e50, "50 EMA", color=color.blue)
+plotshape(setup, title="Buy setup", style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small)
+
+if setup and barstate.isconfirmed
+    label.new(bar_index, low, "BUY " + str.tostring(close, format.mintick) + "\nStop " + str.tostring(stopPrice, format.mintick) + "\nT1 " + str.tostring(close + 2 * riskAmt, format.mintick) + "\nT2 " + str.tostring(close + 3 * riskAmt, format.mintick), style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+
+alertcondition(setup, title="Pullback buy setup", message="{{ticker}}: pullback-to-20-EMA buy setup at {{close}}")
