@@ -39,7 +39,7 @@ const cmd = args.find((a) => !a.startsWith("--")) || "run";
 // ─── State ───────────────────────────────────────────────────────────────────
 
 function loadState() {
-  const blank = { positions: {}, history: [], lastSignal: {}, lastSeen: {}, entriesByDay: {}, lastDigest: "", lastErrorPing: "" };
+  const blank = { positions: {}, history: [], lastSignal: {}, lastSeen: {}, failStreak: {}, entriesByDay: {}, lastDigest: "", lastErrorPing: "" };
   if (!fs.existsSync(STATE_FILE)) return blank;
   return { ...blank, ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) };
 }
@@ -65,6 +65,7 @@ async function getJson(url) {
 const KRAKEN_MINUTES = { "1h": 60, "4h": 240, "1d": 1440 };
 // Oldest the newest closed candle may be (measured from its open). Intraday: two intervals plus
 // slack. Daily: five days, which covers a long weekend.
+const BLIND_AFTER_RUNS = 3; // consecutive failed runs before a symbol is reported as unreadable
 const MAX_AGE_SEC = { "1h": 2.5 * 3600, "4h": 8.5 * 3600, "1d": 5 * 86400 };
 
 async function fetchKraken(feed, timeframe) {
@@ -237,8 +238,10 @@ async function run() {
       });
       if (problem) throw new Error(problem);
       state.lastSeen[asset.symbol] = candles[candles.length - 1].t;
+      delete state.failStreak[asset.symbol];
     } catch (e) {
       errors.push(`${asset.symbol}: ${e.message}`);
+      state.failStreak[asset.symbol] = (state.failStreak[asset.symbol] || 0) + 1;
       continue;
     }
     const ind = indicators(candles);
@@ -283,8 +286,18 @@ async function run() {
   // Tell the user when the bot is blind, at most once a day.
   if (errors.length) {
     console.error(`Data errors:\n  ${errors.join("\n  ")}`);
-    if (errors.length === CONFIG.assets.length && state.lastErrorPing !== today) {
-      await ping({ title: "Signal bot: no market data", priority: 4, tags: ["warning"], body: `Every data fetch failed this run, so nothing is being watched.\n${errors.slice(0, 3).join("\n")}` });
+    // One blip is normal; ping when everything failed, or a symbol has been unreadable for a while.
+    const allFailed = errors.length === CONFIG.assets.length;
+    const blind = Object.entries(state.failStreak).filter(([, n]) => n >= BLIND_AFTER_RUNS).map(([s]) => s);
+    if ((allFailed || blind.length) && state.lastErrorPing !== today) {
+      await ping({
+        title: allFailed ? "Signal bot: no market data" : `Signal bot: can't read ${blind.join(", ")}`,
+        priority: 4,
+        tags: ["warning"],
+        body: allFailed
+          ? `Every data fetch failed this run, so nothing is being watched.\n${errors.slice(0, 3).join("\n")}`
+          : `No usable data for ${blind.join(", ")} in the last ${BLIND_AFTER_RUNS}+ runs, so no pings can come from ${blind.length > 1 ? "them" : "it"}.\n${errors.slice(0, 5).join("\n")}`,
+      });
       state.lastErrorPing = today;
     }
   }
@@ -385,5 +398,8 @@ try {
   await commands[cmd]();
 } catch (e) {
   console.error(`Fatal: ${e.stack || e.message}`);
+  if (cmd === "run" && !DRY) {
+    await ping({ title: "Signal bot crashed", priority: 5, tags: ["rotating_light"], body: `This run stopped with an error, so nothing was checked.\n${e.message}` }).catch(() => {});
+  }
   process.exit(1);
 }
