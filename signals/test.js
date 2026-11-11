@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ema, rsi, atr, indicators, evaluateEntry, evaluateExit, sizePosition, openPosition, backtest } from "./lib.js";
+import { ema, rsi, atr, indicators, evaluateEntry, evaluateExit, sizePosition, openPosition, backtest, feedProblem } from "./lib.js";
 
 const CFG = { pullbackPct: 1.5, volMult: 1.0, maxExtPct: 12, rsiMax: 75, rsiExit: 80, atrMult: 1, minStopPct: 1.5, maxStopPct: 5, timeStopBars: 5 };
 
@@ -130,6 +130,15 @@ test("already-checked candles are not processed twice", () => {
   const second = evaluateExit(first.position, candles, noInd(1), CFG);
   assert.equal(second.events.length, 0);
   assert.equal(second.position.barsHeld, 1);
+});
+
+test("a feed that goes backwards or is stale is rejected", () => {
+  const day = 86400;
+  const now = 100 * day;
+  assert.equal(feedProblem({ lastT: now - day, seenT: now - day, now, maxAgeSec: 5 * day }), null);
+  assert.equal(feedProblem({ lastT: now - day, seenT: 0, now, maxAgeSec: 5 * day }), null);
+  assert.match(feedProblem({ lastT: now - 2 * day, seenT: now - day, now, maxAgeSec: 5 * day }), /backwards/);
+  assert.match(feedProblem({ lastT: now - 6 * day, seenT: 0, now, maxAgeSec: 5 * day }), /stale/);
 });
 
 test("backtest runs end to end and reports consistent totals", () => {

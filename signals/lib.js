@@ -72,6 +72,16 @@ export function indicators(candles) {
   };
 }
 
+// Guards against acting on a feed that is behind. Returns a reason string, or null if the data is usable.
+//   lastT   open time of the newest closed candle in this fetch
+//   seenT   newest candle time any earlier run saw for this symbol (0 if none)
+//   maxAgeSec  how old the newest closed candle may be before the feed counts as stale
+export function feedProblem({ lastT, seenT = 0, now, maxAgeSec }) {
+  if (lastT < seenT) return "feed went backwards (newest candle is older than one already seen)";
+  if (now - lastT > maxAgeSec) return `feed is stale (newest candle is ${Math.round((now - lastT) / 3600)}h old)`;
+  return null;
+}
+
 export const MIN_BARS = 60;
 
 // Evaluate the entry setup on the candle at index `i` (default: the last one).

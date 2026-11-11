@@ -13,7 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { indicators, evaluateEntry, evaluateExit, sizePosition, openPosition, backtest } from "./lib.js";
+import { indicators, evaluateEntry, evaluateExit, sizePosition, openPosition, backtest, feedProblem } from "./lib.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.dirname(HERE);
@@ -39,7 +39,7 @@ const cmd = args.find((a) => !a.startsWith("--")) || "run";
 // ─── State ───────────────────────────────────────────────────────────────────
 
 function loadState() {
-  const blank = { positions: {}, history: [], lastSignal: {}, entriesByDay: {}, lastDigest: "", lastErrorPing: "" };
+  const blank = { positions: {}, history: [], lastSignal: {}, lastSeen: {}, entriesByDay: {}, lastDigest: "", lastErrorPing: "" };
   if (!fs.existsSync(STATE_FILE)) return blank;
   return { ...blank, ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) };
 }
@@ -63,6 +63,9 @@ async function getJson(url) {
 }
 
 const KRAKEN_MINUTES = { "1h": 60, "4h": 240, "1d": 1440 };
+// Oldest the newest closed candle may be (measured from its open). Intraday: two intervals plus
+// slack. Daily: five days, which covers a long weekend.
+const MAX_AGE_SEC = { "1h": 2.5 * 3600, "4h": 8.5 * 3600, "1d": 5 * 86400 };
 
 async function fetchKraken(feed, timeframe) {
   const mins = KRAKEN_MINUTES[timeframe];
@@ -87,12 +90,22 @@ async function fetchYahoo(feed, timeframe) {
   const session = r.meta.currentTradingPeriod?.regular;
   const now = Date.now() / 1000;
   const out = [];
+  let droppedForming = false;
   for (let i = 0; i < r.timestamp.length; i++) {
-    if ([q.open[i], q.high[i], q.low[i], q.close[i]].some((v) => v == null)) continue;
     const t = r.timestamp[i];
     // Today's bar is still forming until the regular session ends.
-    if (session && t >= session.start && now < session.end) continue;
+    if (session && t >= session.start && now < session.end) {
+      droppedForming = true;
+      continue;
+    }
+    if ([q.open[i], q.high[i], q.low[i], q.close[i]].some((v) => v == null)) continue;
     out.push({ t, open: q.open[i], high: q.high[i], low: q.low[i], close: q.close[i], volume: q.volume[i] || 0 });
+  }
+  // Yahoo sometimes serves a response without the most recent finished session. Outside market
+  // hours the newest bar must be the session of the last regular trade, or the data is behind.
+  const lastTrade = r.meta.regularMarketTime;
+  if (!droppedForming && lastTrade && out.length && out[out.length - 1].t < lastTrade - 12 * 3600) {
+    throw new Error(`Yahoo: latest daily bar for ${feed} is missing`);
   }
   return out;
 }
@@ -216,6 +229,14 @@ async function run() {
     try {
       candles = await fetchCandles(asset, cls);
       if (candles.length < 60) throw new Error(`only ${candles.length} candles for ${asset.symbol}`);
+      const problem = feedProblem({
+        lastT: candles[candles.length - 1].t,
+        seenT: state.lastSeen[asset.symbol],
+        now: Date.now() / 1000,
+        maxAgeSec: MAX_AGE_SEC[cls.timeframe],
+      });
+      if (problem) throw new Error(problem);
+      state.lastSeen[asset.symbol] = candles[candles.length - 1].t;
     } catch (e) {
       errors.push(`${asset.symbol}: ${e.message}`);
       continue;
